@@ -24,7 +24,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import apparent_catalog as ac
 
-__version__ = "v1.0.261115-1"
+__version__ = "v1.1.261115-2"
 
 D2R = np.pi / 180.0
 

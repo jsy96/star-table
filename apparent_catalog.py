@@ -36,7 +36,7 @@ import time
 import numpy as np
 import erfa
 
-__version__ = "v1.0.261115-1"
+__version__ = "v1.1.261115-2"
 
 DJ00 = 2451545.0            # J2000.0 (TDB)
 GAIA_EPOCH_JD = 2457389.0   # Gaia DR3 星表历元 J2016.0
@@ -99,6 +99,70 @@ def itrs_to_gcrs(utc, r_itrs, v_itrs, dut1=0.0, xp=0.0, yp=0.0):
     v = rc2t.T @ np.asarray(v_itrs, float)
     w = np.array([0.0, 0.0, erfa.W])                          # 地球自转角速度 rad/s
     return r, v + np.cross(w, r)
+
+
+# ----------------------------------------------------------------------
+# IERS EOP C04 (IAU2000)
+# ----------------------------------------------------------------------
+def load_eop_c04(path):
+    """解析 IERS EOP C04 (IAU2000) 文本文件（update_eop.py 下载维护）。
+
+    返回 dict: mjd_utc, xp_as, yp_as, dut1_s, lod_s, dx_as, dy_as (升序数组)。
+    """
+    rows = []
+    with open(path, "r", encoding="ascii", errors="replace") as f:
+        for line in f:
+            t = line.split()
+            if len(t) < 10:
+                continue
+            try:
+                iy, im, id_ = int(t[0]), int(t[1]), int(t[2])
+                vals = [float(x) for x in t[3:10]]
+            except ValueError:
+                continue
+            mjd = vals[0]
+            if not (1962 <= iy <= 2100 and 30000.0 < mjd < 90000.0):
+                continue
+            rows.append((mjd, *vals[1:]))
+    if len(rows) < 2:
+        raise ValueError(f"EOP 文件解析失败: {path}")
+    arr = np.array(rows)  # mjd, xp, yp, dut1, lod, dx, dy
+    return {"mjd_utc": arr[:, 0], "xp_as": arr[:, 1], "yp_as": arr[:, 2],
+            "dut1_s": arr[:, 3], "lod_s": arr[:, 4],
+            "dx_as": arr[:, 5], "dy_as": arr[:, 6]}
+
+
+def eop_get(eop, mjd_utc):
+    """线性插值取 EOP；越界返回最近端点值（与 C 版 ac_eop_get 一致）。"""
+    m = eop["mjd_utc"]
+    i = np.clip(np.searchsorted(m, mjd_utc), 1, len(m) - 1)
+    if mjd_utc <= m[0]:
+        i = 1
+    t = (mjd_utc - m[i - 1]) / (m[i] - m[i - 1])
+    out = []
+    for k in ("xp_as", "yp_as", "dut1_s", "dx_as", "dy_as"):
+        v = eop[k]
+        out.append(v[i - 1] + t * (v[i] - v[i - 1]))
+    return tuple(out)
+
+
+def itrs_to_gcrs_eop(eop, utc, r_itrs, v_itrs):
+    """用 IERS EOP (极移+DUT1) 做 ITRS→GCRS 状态转换（与 C 版一致）。
+
+    返回 (r_gcrs_km, v_gcrs_kms)。v_g = Rᵀ(v_i + ω×r_i)。
+    """
+    d1, d2 = _utc_two_part(utc)
+    tt = erfa.taitt(*erfa.utctai(d1, d2))
+    jd_utc = d1 + d2
+    mjd = jd_utc - 2400000.5
+    xp, yp, dut1, dx, dy = eop_get(eop, mjd)
+    ut1 = jd_utc + dut1 / 86400.0
+    rc2t = erfa.c2t06a(tt[0], tt[1], ut1, 0.0,
+                       xp * erfa.DAS2R, yp * erfa.DAS2R)
+    r = np.asarray(r_itrs, float)
+    v = np.asarray(v_itrs, float)
+    w = np.array([0.0, 0.0, erfa.W])
+    return rc2t.T @ r, rc2t.T @ (v + np.cross(w, r))
 
 
 # ----------------------------------------------------------------------

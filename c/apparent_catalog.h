@@ -25,7 +25,7 @@ extern "C" {
 #endif
 
 /* ---- 常量 ---- */
-#define AC_VERSION_STRING   "v1.0.261115-1"
+#define AC_VERSION_STRING   "v1.1.261115-2"
 #define AC_EPOCH_GAIA_J2016 2457389.0   /* Gaia DR3 星表历元 J2016.0 (JD) */
 #define AC_EPOCH_J2000      2451545.0   /* 星表已传播至 J2000.0 */
 
@@ -35,6 +35,8 @@ extern "C" {
 #define AC_E_TIME     (-2)   /* 时刻超出 epv00/闰秒表有效范围 (1900–2100) */
 #define AC_E_FORMAT   (-3)   /* 星表文件格式不符 */
 #define AC_E_IO       (-4)   /* 星表文件读写错误 */
+#define AC_E_EOP      (-5)   /* EOP 文件读取/解析错误 */
+#define AC_W_EOP_RANGE (+1)  /* 警告: 请求时刻超出 EOP 数据范围, 已用端点值 */
 
 /* ---- 二进制星表: 记录 (80 字节, 与文件布局一一对应) ---- */
 typedef struct {
@@ -128,6 +130,66 @@ int ac_apparent_star(const ac_star_record_t *rec,
                      double *ra_app_deg,
                      double *dec_app_deg,
                      ac_breakdown_t *brk);
+
+/* ============================================================
+ * IERS EOP C04（IAU2000）接入与 ITRS/ECEF 支持
+ * ============================================================ */
+
+/* 单日 EOP 记录（每日 0h UTC） */
+typedef struct {
+    double mjd_utc;   /* 简化儒略日 (UTC) */
+    double xp_as;     /* 极移 X, arcsec */
+    double yp_as;     /* 极移 Y, arcsec */
+    double dut1_s;    /* UT1-UTC, s */
+    double lod_s;     /* 日长, s */
+    double dx_as;     /* 天极偏差 dX, arcsec */
+    double dy_as;     /* 天极偏差 dY, arcsec */
+} ac_eop_record_t;
+
+typedef struct {
+    int n;
+    ac_eop_record_t *rec;   /* 按 mjd 升序 */
+    double mjd_first, mjd_last;
+} ac_eop_t;
+
+/* 解析 IERS EOP C04 (IAU2000) 文本文件（update_eop.py 下载的
+ * eopc04_IAU2000.62-now，格式: 日期 MJD x y UT1-UTC LOD dX dY ...） */
+int ac_eop_load(const char *path, ac_eop_t *eop);
+
+void ac_eop_free(ac_eop_t *eop);
+
+/* 按时刻线性插值 EOP（mjd_utc = JD_UTC − 2400000.5）。
+ * 数据范围内返回 AC_OK；越界返回 AC_W_EOP_RANGE 并使用最近端点值
+ * （C04 月更滞后约 30 天，实时任务请评估 DUT1 外推误差，
+ *  ~LOD×滞后天数 ≈ 0.5 ms/天）。 */
+int ac_eop_get(const ac_eop_t *eop, double mjd_utc,
+               double *xp_as, double *yp_as, double *dut1_s,
+               double *dx_as, double *dy_as);
+
+/* ITRS(地固/ECEF) → GCRS(惯性) 状态转换（位置 km、速度 km/s）。
+ * 使用 EOP 极移 + DUT1 + IAU 2006/2000A 无旋转原点岁差章动
+ * （erfaC2t06a 链路）；速度含地球自转修正 v_g = Rᵀ(v_i + ω×r_i)，
+ * 忽略岁差章动变率（<4 μm/s）。 */
+int ac_itrs_to_gcrs(const ac_eop_t *eop, double jd_utc,
+                    double r_itrs[3], double v_itrs[3],
+                    double r_gcrs[3], double v_gcrs[3]);
+
+/* GCRS → ITRS 逆变换 */
+int ac_gcrs_to_itrs(const ac_eop_t *eop, double jd_utc,
+                    double r_gcrs[3], double v_gcrs[3],
+                    double r_itrs[3], double v_itrs[3]);
+
+/* 一步到位: ITRS 卫星状态 → 在轨观测星表（内部先转 GCRS） */
+int ac_apparent_catalog_itrs(const ac_catalog_t *cat,
+                             const ac_eop_t *eop,
+                             double jd_utc,
+                             double r_sat_itrs_km[3],
+                             double v_sat_itrs_kms[3],
+                             unsigned defl_flags,
+                             double *ra_app_deg,
+                             double *dec_app_deg,
+                             double *unit_gcrs,
+                             ac_breakdown_t *brk);
 
 #ifdef __cplusplus
 }
