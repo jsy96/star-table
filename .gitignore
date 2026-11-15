@@ -1,0 +1,10 @@
+# build artifacts
+build/
+__pycache__/
+*.pyc
+
+# large data (source csv & generated catalogs, sample outputs)
+*.csv
+*.npz
+*.bin
+*.png
