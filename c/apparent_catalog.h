@@ -25,7 +25,7 @@ extern "C" {
 #endif
 
 /* ---- 常量 ---- */
-#define AC_VERSION_STRING   "v1.1.261115-5"
+#define AC_VERSION_STRING   "v1.1.261115-6"
 #define AC_EPOCH_GAIA_J2016 2457389.0   /* Gaia DR3 星表历元 J2016.0 (JD) */
 #define AC_EPOCH_J2000      2451545.0   /* 星表已传播至 J2000.0 */
 

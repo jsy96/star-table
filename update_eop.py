@@ -16,7 +16,7 @@ update_eop.py —— IERS EOP C04 接入流水线：下载 → 更新 → 编译
   eop/eopc04_IAU2000.62-now   EOP 数据（原子替换, 旧版备份 .prev）
   EOP_report.md               全流程报告
 
-版本: v1.1.261115-5
+版本: v1.1.261115-6
 """
 import argparse
 import csv
@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 import numpy as np
 import erfa
 
-__version__ = "v1.1.261115-5"
+__version__ = "v1.1.261115-6"
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 EOP_DIR = os.path.join(ROOT, "eop")
@@ -623,6 +623,25 @@ def step_report(path):
     d = R.get("download", {})
     b = R.get("build", {})
     t = R.get("test", {})
+
+    # 数据节以磁盘上的最终文件为准（下载后可能又合并了快速产品）,
+    # 避免"统计取自合并前"造成的假象
+    if d.get("ok") and os.path.exists(EOP_FILE):
+        try:
+            _rows = parse_eop(EOP_FILE)
+            _last = _rows[-1]
+            d["n"] = len(_rows)
+            d["mjd_last"] = _last[1]
+            d["date_last"] = mjd2date(_last[1])
+            d["lag_days"] = mjd_now() - _last[1]
+            d["fresh"] = d["lag_days"] <= 50.0
+            d["size"] = os.path.getsize(EOP_FILE)
+            d["sha256"] = sha256_of(EOP_FILE)
+            d["latest"] = {"xp_as": _last[2], "yp_as": _last[3],
+                           "dut1_s": _last[4], "lod_s": _last[5],
+                           "dx_as": 0.0, "dy_as": 0.0}
+        except Exception as e:                            # noqa: BLE001
+            log(f"  数据重统计失败（沿用下载时统计）: {e}")
     lines = []
     A = lines.append
     A("# IERS EOP C04 接入流水线报告")

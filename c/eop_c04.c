@@ -8,7 +8,7 @@
  * ITRS→GCRS 旋转 = erfaC2t06a（EOP 极移 + DUT1 + IAU2006/2000A 岁差章动,
  * 无旋转原点 CIO 体系）; 速度含地球自转项 v_g = Rᵀ(v_i + ω×r_i)。
  *
- * 版本: v1.1.261115-5
+ * 版本: v1.1.261115-6
  */
 #include "apparent_catalog.h"
 
