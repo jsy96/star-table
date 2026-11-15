@@ -36,7 +36,7 @@ import time
 import numpy as np
 import erfa
 
-__version__ = "v1.1.261115-4"
+__version__ = "v1.1.261115-5"
 
 DJ00 = 2451545.0            # J2000.0 (TDB)
 GAIA_EPOCH_JD = 2457389.0   # Gaia DR3 星表历元 J2016.0

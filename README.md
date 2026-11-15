@@ -10,6 +10,15 @@ IERS EOP C04 极移+DUT1 转换），输出该时刻该位置的整表恒星**�
 
 ## 更新记录（最新在前）
 
+- **2026-11-15 v1.1.261115-5**：快速产品实装落地 + **一键脚本**。
+  - `run_eop_pipeline.bat`：双击即可执行全流程（下载→快速合并→编译→测试→报告；
+    自动探测 `eop/finals.daily`，纯英文脚本避免 GBK 乱码）；
+  - finals.daily 解析改**固定列宽切片**（月日在日<10 时 token 数漂移、标志字母
+    与数值粘连 `I-0.0581`/`P-0.159`，按列切才可靠），预测行 LOD 缺省置 0；
+  - **实测合并效果**：181 行快速数据并入 C04 之后至 2027-02-13，有效滞后 0 天
+    （预测段覆盖未来 89 天）；重叠段 30 天实测 |快速−最终|：极移 ≤0.13 mas、
+    DUT1 ≤0.059 ms——快速产品真实精度实测确认（此前 30 ms 假差异系 token
+    错位）；DUT1 拼接偏置校正自动拟合（本次 a=−0.015 ms ≈ 0，残差 0.022 ms）。
 - **2026-11-15 v1.1.261115-4**：EOP 策略升级为**双模自动**——快速产品
   （USNO `finals.daily`）可达时：C04 历史基底 + 快速产品补充末端（合并为同名
   同格式文件，**C 库零改动**），重叠段保留 C04 最终值，滞后从 ~30 天降至 ~1 天；
@@ -123,9 +132,16 @@ ac_eop_free(&eop);
 
 ### 3b. IERS EOP 流水线（下载/更新/编译/测试/报告）
 
+**一键执行（推荐，双击或命令行）**：`run_eop_pipeline.bat`
+（自动探测 `eop\finals.daily`，存在即合并快速产品；参数透传给 update_eop.py，
+如 `run_eop_pipeline.bat --skip-download`；脚本纯英文防 GBK 乱码）。
+
+手动方式：
+
 ```bash
 uv run --no-project --with numpy --with pyerfa python -I update_eop.py
-#   可选: --skip-download / --skip-build / --skip-test / --input 本地EOP文件
+#   可选: --skip-download / --skip-build / --skip-test
+#         --input 本地C04文件 / --input-rapid eop/finals.daily
 #   产物: eop/eopc04_IAU2000.62-now (旧版自动备份 .prev) + EOP_report.md
 ```
 

@@ -16,7 +16,7 @@ update_eop.py —— IERS EOP C04 接入流水线：下载 → 更新 → 编译
   eop/eopc04_IAU2000.62-now   EOP 数据（原子替换, 旧版备份 .prev）
   EOP_report.md               全流程报告
 
-版本: v1.1.261115-4
+版本: v1.1.261115-5
 """
 import argparse
 import csv
@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 import numpy as np
 import erfa
 
-__version__ = "v1.1.261115-4"
+__version__ = "v1.1.261115-5"
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 EOP_DIR = os.path.join(ROOT, "eop")
@@ -79,29 +79,41 @@ def log(msg):
 # ----------------------------------------------------------------------
 # 1b) 快速产品 (finals.daily): 解析 + 与 C04 合并
 # ----------------------------------------------------------------------
-def parse_rapid(path):
-    """解析 USNO finals.daily / finals2000A.daily（空格分隔, 误差列穿插）。
+def _tofloat_flag(tok):
+    """'I-0.0581'/'P-0.159'/' 0.211485 ...' → 首个数值（剥粘连标志字母）。"""
+    tok = tok.strip()
+    if tok[:1].isalpha():
+        tok = tok[1:]
+    return float(tok.split()[0])
 
-    列序: MJD x xerr y yerr UT1-UTC ut1err LOD loderr [dX dxerr dY dyerr]
-    （1980 版末列为 dpsi/deps, 本项目视方向与 c2t06a 均不消费, 忽略。）
-    返回 [(mjd, x_as, y_as, dut1_s, lod_s), ...] 按 mjd 升序。
+
+def parse_rapid(path):
+    """解析 USNO ser7 finals.daily（固定列宽格式, 2026-11 实测样本确认）。
+
+    列位(1-based): YY=1-2, MDD=4-6, MJD=8-15, x=20-27, xerr=29-36,
+    y=39-46, yerr=48-55, UT1flag=59, UT1-UTC=60-68(可粘连至69),
+    LOD=81-86（月日在日<10 时 token 数漂移, 必须按列切片）。
+    dpsi/deps 本项目不消费。
+    返回 [(mjd, x_as, y_as, dut1_s, lod_s), ...] 按 mjd 升序（含 P 预测段）。
     """
     rows = []
     with open(path, "r", encoding="ascii", errors="replace") as f:
         for line in f:
-            t = line.split()
-            if len(t) < 9:
+            if len(line) < 70:          # 至少需覆盖到 UT1 数值列
                 continue
             try:
-                mjd = float(t[0])
-                x = float(t[1])
-                y = float(t[3])
-                dut1 = float(t[5])
-                lod = float(t[7])
-            except ValueError:
+                mjd = float(line[7:15])
+                x = _tofloat_flag(line[19:27])
+                y = _tofloat_flag(line[38:46])
+                dut1 = _tofloat_flag(line[58:69])
+            except (ValueError, IndexError):
                 continue
             if not (30000.0 < mjd < 90000.0):
                 continue
+            try:                        # 预测行 LOD 列常缺省 → 0
+                lod = _tofloat_flag(line[80:86])
+            except (ValueError, IndexError):
+                lod = 0.0
             rows.append((mjd, x, y, dut1, lod))
     rows.sort(key=lambda r: r[0])
     return rows
@@ -112,15 +124,37 @@ def merge_rapid_into_c04(c04_path, rapid_rows):
 
     只取快速产品中 MJD > C04 末端的行（C04 重叠段为最终值, 保留不动）。
     dX/dY 置 0（视方向不做章动修正、c2t06a 不消费该列, 无影响）。
-    返回 (n_appended, mjd_first_rapid, mjd_last_rapid)。
+
+    DUT1 偏置校正: C04 与快速序列末端段均为非最终解, 实测重叠段差呈趋势
+    发散(可达 ~30 ms)。用重叠段线性拟合 diff(mjd), 对快速段 DUT1 扣除该
+    拟合值, 保证拼接连续且对齐 C04 基底; 极移差 <0.2 mas 不校正。
+
+    返回 (n_appended, mjd_first_rapid, mjd_last_rapid, bias)，
+    bias=None 或 {"a_s", "b_s_per_day", "resid_rms_s", "n_overlap"}。
     """
     rows = parse_eop(c04_path)
+    m04 = {r[1]: r for r in rows}
     last = rows[-1][1]
     add = [r for r in rapid_rows if r[0] > last]
     if not add:
-        return 0, None, None
+        return 0, None, None, None
+
+    bias = None
+    ov = [(r[0], r[3] - m04[r[0]][4]) for r in rapid_rows if r[0] in m04]
+    if len(ov) >= 10:
+        m0 = ov[0][0]
+        x = np.array([d - m0 for d, _ in ov])
+        y = np.array([v for _, v in ov])
+        b, a = np.polyfit(x, y, 1)
+        resid = y - (a + b * x)
+        bias = {"a_s": float(a), "b_s_per_day": float(b),
+                "resid_rms_s": float(np.sqrt((resid ** 2).mean())),
+                "n_overlap": len(ov)}
+
     with open(c04_path, "a", encoding="ascii") as f:
         for mjd, x, y, dut1, lod in add:
+            if bias:
+                dut1 -= bias["a_s"] + bias["b_s_per_day"] * (mjd - ov[0][0])
             y_, m_, d_, _fd = erfa.jd2cal(2400000.5, mjd)
             f.write(f"{y_:4d} {m_:2d} {d_:2d} {mjd:7.1f} {x:11.6f} {y:11.6f} "
                     f"{dut1:12.7f} {lod:11.7f} "
@@ -128,7 +162,7 @@ def merge_rapid_into_c04(c04_path, rapid_rows):
                     f"{'0.000000':>11s} {'0.000000':>11s} "
                     f"{'0.0000000':>12s} {'0.0000000':>12s} "
                     f"{'0.000000':>11s} {'0.000000':>11s}\n")
-    return len(add), add[0][0], add[-1][0]
+    return len(add), add[0][0], add[-1][0], bias
 
 
 def rapid_vs_c04_diff(c04_rows, rapid_rows, n_days=30):
@@ -150,54 +184,68 @@ def rapid_vs_c04_diff(c04_rows, rapid_rows, n_days=30):
 
 
 def step_rapid(args):
-    """下载/定位快速产品并与 C04 合并。返回报告信息 dict。"""
+    """下载/定位快速产品并与 C04 合并。返回报告信息 dict（失败时 mode=none）。"""
     log("\n===== [1b] 快速产品 (finals.daily) =====")
     info = {"mode": "none"}
-    rapid_rows = None
 
-    src = None
-    if args.input_rapid and os.path.exists(args.input_rapid):
-        shutil.copyfile(args.input_rapid, RAPID_FILE)
-        src = f"本地文件 {args.input_rapid}"
-    else:
-        tmp = RAPID_FILE + ".tmp"
-        for name, url in RAPID_SOURCES:
-            try:
-                http_download(url, tmp, timeout=180)
-                os.replace(tmp, RAPID_FILE)
-                src = f"{name} :: {url}"
-                break
-            except Exception as e:                    # noqa: BLE001
-                log(f"  快速源失败: {name}: {e}")
-    if src is None:
-        log("  快速产品源不可达 → 退化为纯 C04 长期产品 + 外推（当前模式）")
-        log("  手动启用: 下载 https://maia.usno.navy.mil/ser7/finals.daily"
-            " 放到 eop/ 后加参数 --input-rapid eop/finals.daily")
+    def _give_up(msg):
+        log(msg)
         return info
 
-    rapid_rows = parse_rapid(RAPID_FILE)
-    if len(rapid_rows) < 10:
-        log(f"  快速产品解析异常（{len(rapid_rows)} 行）→ 忽略")
-        return info
-    log(f"  快速产品: {len(rapid_rows)} 行, "
-        f"覆盖 MJD {rapid_rows[0][0]:.0f}~{rapid_rows[-1][0]:.0f}")
+    try:
+        src = None
+        if args.input_rapid and os.path.exists(args.input_rapid):
+            if os.path.abspath(args.input_rapid) != os.path.abspath(RAPID_FILE):
+                shutil.copyfile(args.input_rapid, RAPID_FILE)
+            src = f"本地文件 {args.input_rapid}"
+        else:
+            tmp = RAPID_FILE + ".tmp"
+            for name, url in RAPID_SOURCES:
+                try:
+                    http_download(url, tmp, timeout=180)
+                    os.replace(tmp, RAPID_FILE)
+                    src = f"{name} :: {url}"
+                    break
+                except Exception as e:                    # noqa: BLE001
+                    log(f"  快速源失败: {name}: {e}")
+        if src is None:
+            return _give_up(
+                "  快速产品源不可达 → 退化为纯 C04 长期产品 + 外推（当前模式）\n"
+                "  手动启用: 下载 https://maia.usno.navy.mil/ser7/finals.daily"
+                " 放到 eop/ 后加参数 --input-rapid eop/finals.daily")
 
-    c04_rows = parse_eop(EOP_FILE)
-    diff = rapid_vs_c04_diff(c04_rows, rapid_rows)
-    n_app, m0, m1 = merge_rapid_into_c04(EOP_FILE, rapid_rows)
-    info = {"mode": "merged", "source": src, "n_rapid": len(rapid_rows),
-            "mjd_rapid_last": rapid_rows[-1][0],
-            "date_rapid_last": mjd2date(rapid_rows[-1][0]),
-            "n_appended": n_app, "diff": diff}
-    if n_app:
-        log(f"  已合并 {n_app} 行快速数据到 C04 之后（至 "
-            f"{mjd2date(m1)}），滞后降至 {mjd_now() - m1:.1f} 天")
-    else:
-        log("  快速产品未超出 C04 末端, 无需合并")
-    if diff:
-        log(f"  重叠段实测 |快速−最终|: 极移 max {diff['pm_max_mas']:.2f} mas, "
-            f"DUT1 max {diff['dut1_max_ms']:.3f} ms（{diff['n']} 天样本）")
-    return info
+        rapid_rows = parse_rapid(RAPID_FILE)
+        if len(rapid_rows) < 10:
+            return _give_up(f"  快速产品解析异常（{len(rapid_rows)} 行）→ 忽略")
+        log(f"  快速产品: {len(rapid_rows)} 行, "
+            f"覆盖 MJD {rapid_rows[0][0]:.0f}~{rapid_rows[-1][0]:.0f}")
+
+        c04_rows = parse_eop(EOP_FILE)
+        diff = rapid_vs_c04_diff(c04_rows, rapid_rows)
+        n_app, m0, m1, bias = merge_rapid_into_c04(EOP_FILE, rapid_rows)
+        info = {"mode": "merged", "source": src, "n_rapid": len(rapid_rows),
+                "mjd_rapid_last": rapid_rows[-1][0],
+                "date_rapid_last": mjd2date(rapid_rows[-1][0]),
+                "n_appended": n_app, "diff": diff, "bias": bias}
+        if n_app:
+            lag = mjd_now() - m1
+            lag_txt = (f"{lag:.1f} 天" if lag >= 0 else
+                       f"0 天（预测段延伸至未来 {-lag:.1f} 天）")
+            log(f"  已合并 {n_app} 行快速数据到 C04 之后（至 "
+                f"{mjd2date(m1)}），有效滞后 {lag_txt}")
+        else:
+            log("  快速产品未超出 C04 末端, 无需合并")
+        if diff:
+            log(f"  重叠段实测 |快速−最终|: 极移 max {diff['pm_max_mas']:.2f} mas, "
+                f"DUT1 max {diff['dut1_max_ms']:.3f} ms（{diff['n']} 天样本）")
+        if bias:
+            log(f"  DUT1 偏置校正（重叠段线性拟合）: a={bias['a_s'] * 1e3:+.3f} ms, "
+                f"b={bias['b_s_per_day'] * 1e3:+.4f} ms/天, "
+                f"残差 rms={bias['resid_rms_s'] * 1e3:.3f} ms")
+        return info
+    except Exception as e:                                # noqa: BLE001
+        log(f"  快速产品步骤异常（退化为纯 C04 模式）: {e}")
+        return {"mode": "none"}
 
 
 # ----------------------------------------------------------------------
@@ -595,8 +643,12 @@ def step_report(path):
              if d.get("n_prev") else ""))
         A(f"- 覆盖范围：{d['date_first']} ~ {d['date_last']}"
           f"（MJD {d['mjd_first']:.0f}–{d['mjd_last']:.0f}）")
-        A(f"- 新鲜度：距今滞后 **{lag:.1f} 天** "
-          f"{'✅ 正常（C04 约月更）' if d['fresh'] else '⚠️ 偏旧，检查数据源'}")
+        if lag >= 0:
+            A(f"- 新鲜度：距今滞后 **{lag:.1f} 天** "
+              f"{'✅ 正常（C04 约月更）' if d['fresh'] else '⚠️ 偏旧，检查数据源'}")
+        else:
+            A(f"- 新鲜度：✅ 当前时刻位于数据覆盖内（末端延伸至未来 "
+              f"{-lag:.1f} 天, 含快速产品预测段）")
         lt = d["latest"]
         A("")
         A("| 最新历元参数 | 数值 |")
@@ -612,9 +664,11 @@ def step_report(path):
             rp = R.get("rapid", {})
             A("")
             if rp.get("mode") == "merged":
+                eff = mjd_now() - rp.get("mjd_rapid_last", mjd_now())
+                lag_txt = (f"当前有效滞后 {eff:.1f} 天" if eff >= 0 else
+                           f"当前时刻在快速产品覆盖内（预测段延伸至未来 {-eff:.1f} 天）")
                 A(f"> **策略**：长期产品 C04 为历史基底 + **快速产品 finals.daily**"
-                  f"补充末端（至 {rp.get('date_rapid_last', '?')}），当前有效滞后 "
-                  f"{mjd_now() - rp.get('mjd_rapid_last', mjd_now()):.1f} 天；"
+                  f"补充末端（至 {rp.get('date_rapid_last', '?')}），{lag_txt}；"
                   f"仅超出快速产品末端的部分才外推（DUT1 按 −LOD·Δ、极移按末端"
                   f"30 天线性趋势）。")
             else:
@@ -634,11 +688,17 @@ def step_report(path):
         A(f"- 来源：{rp['source']}")
         A(f"- 快速序列：{rp['n_rapid']} 行，末端 {rp['date_rapid_last']}")
         A(f"- 本次并入 C04 之后：{rp['n_appended']} 行（重叠段保留 C04 最终值）")
-        d = rp.get("diff")
-        if d:
-            A(f"- 重叠段实测 |快速−最终|（{d['n']} 天）：极移 max "
-              f"{d['pm_max_mas']:.2f} mas，DUT1 max {d['dut1_max_ms']:.3f} ms"
-              f" —— 即合并模式下末端数据的实际精度")
+        dfov = rp.get("diff")
+        if dfov:
+            A(f"- 重叠段实测 |快速−最终|（{dfov['n']} 天）：极移 max "
+              f"{dfov['pm_max_mas']:.2f} mas，DUT1 max {dfov['dut1_max_ms']:.3f} ms"
+              f"（两产品同源, 该值即快速段实际精度）")
+        b_ = rp.get("bias")
+        if b_:
+            A(f"- DUT1 拼接偏置校正（重叠段 {b_['n_overlap']} 天线性拟合）："
+              f"a={b_['a_s'] * 1e3:+.3f} ms，b={b_['b_s_per_day'] * 1e3:+.4f} ms/天，"
+              f"校正后残差 rms={b_['resid_rms_s'] * 1e3:.3f} ms —— 快速段已对齐"
+              f"C04 基底，拼接处无跳变")
     A("")
     A("## 二、编译")
     if b.get("ok") is True:
@@ -706,7 +766,10 @@ def step_report(path):
     stamp = now_utc().strftime("%Y-%m-%d %H:%M UTC")
     entry = f"- **{stamp}**：{d.get('date_last', '?')} 数据"
     if d.get("ok"):
-        entry += f"（{d['n']:,} 天，滞后 {d['lag_days']:.1f} 天）；"
+        lag_e = d["lag_days"]
+        lag_s = (f"滞后 {lag_e:.1f} 天" if lag_e >= 0 else
+                 f"覆盖至未来 {-lag_e:.1f} 天")
+        entry += f"（{d['n']:,} 天，{lag_s}）；"
     entry += "编译" + ("✅" if b.get("ok") else "❌") + "，测试"
     entry += "✅" if t.get("ok") else "❌"
     old = []
@@ -765,12 +828,12 @@ def main():
             ok = False
     else:
         ok = step_download(args)
-        if ok:
-            R["rapid"] = step_rapid(args)
     if not ok:
         log("数据不可用，终止。")
         step_report(args.report)
         return 1
+    # 快速产品: 无论是否跳过网络下载, 本地 finals.daily 存在即合并
+    R["rapid"] = step_rapid(args)
 
     if not args.skip_build:
         ok = step_build()

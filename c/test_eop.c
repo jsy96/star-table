@@ -12,7 +12,7 @@
  *   T6 导出 eop_rotation_sample.csv 供 Python(erfa) 交叉验证
  *   T7 (可选, 给定星表) ac_apparent_catalog_itrs 冒烟测试
  *
- * 版本: v1.1.261115-4
+ * 版本: v1.1.261115-5
  */
 #include "apparent_catalog.h"
 
