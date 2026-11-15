@@ -16,7 +16,7 @@ update_eop.py —— IERS EOP C04 接入流水线：下载 → 更新 → 编译
   eop/eopc04_IAU2000.62-now   EOP 数据（原子替换, 旧版备份 .prev）
   EOP_report.md               全流程报告
 
-版本: v1.1.261115-2
+版本: v1.1.261115-3
 """
 import argparse
 import csv
@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 import numpy as np
 import erfa
 
-__version__ = "v1.1.261115-2"
+__version__ = "v1.1.261115-3"
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 EOP_DIR = os.path.join(ROOT, "eop")
@@ -255,10 +255,12 @@ def step_build():
     n_warn = out.count("warning C")
     n_err = out.count("error C")
     ok = r.returncode == 0 and n_err == 0
+    if not ok:
+        log("  构建失败详情(末 500 字符):\n" + out[-500:])
     exes = [f for f in ("test_apparent_catalog.exe", "test_eop.exe")
             if os.path.exists(os.path.join(bdir, "Release", f))]
-    log(f"  构建{'成功' if ok else '失败'}: warning={n_warn} error={n_err}, "
-        f"产物: {', '.join(exes)}")
+    log(f"  构建{'成功' if ok else '失败'}: returncode={r.returncode} "
+        f"warning={n_warn} error={n_err}, 产物: {', '.join(exes)}")
     R["build"] = {"ok": ok, "warnings": n_warn, "errors": n_err,
                   "targets": exes, "vs": os.path.basename(vs) if vs else "?",
                   "time": now_utc().strftime("%Y-%m-%d %H:%M:%S UTC")}
@@ -273,6 +275,56 @@ def run_cmd(cmd, cwd):
                        env={**os.environ, "PYTHONIOENCODING": "utf-8"})
     out = (r.stdout + r.stderr).decode("utf-8", errors="replace")
     return r.returncode, out
+
+
+# ----------------------------------------------------------------------
+# 3b) 长期产品外推精度留出回测（不使用 IERS 快速产品）
+# ----------------------------------------------------------------------
+def backtest_extrapolation(horizons=(1, 5, 10, 20, 31), n_starts=6):
+    """用 C04 自身历史做留出回测。
+
+    对每个预测跨度 h: 取 6 个截断起点 t0（相隔 30 天），只用 t0 及之前的数据，
+    以 [t0-30, t0] 线性趋势外推极移、以 -LOD 外推 DUT1，与 t0+k (k=1..h) 真值
+    比对；同时给出"端点保持（不外推）"对照。折合地固旋转误差 = 矢量合成
+    (极移误差 + DUT1×ω 换算, 1 ms ↔ 0.0150″)。
+    """
+    rows = parse_eop(EOP_FILE)
+    m = np.array([r[1] for r in rows])
+    xp = np.array([r[2] for r in rows])
+    yp = np.array([r[3] for r in rows])
+    dut = np.array([r[4] for r in rows])
+    lod = np.array([r[5] for r in rows])
+    out = []
+    for h in horizons:
+        e_ext = []      # (dut_ms, pm_as) 外推
+        e_hold = []     # (dut_ms, pm_as) 端点保持
+        for j in range(n_starts):
+            i0 = len(m) - 1 - h - 30 * j
+            if i0 - 30 < 0:
+                break
+            j0 = max(0, i0 - 30)
+            x = m[j0:i0 + 1] - m[i0]
+            bx, ax_ = np.polyfit(x, xp[j0:i0 + 1], 1)
+            by, ay_ = np.polyfit(x, yp[j0:i0 + 1], 1)
+            for k in range(1, h + 1):
+                ik = i0 + k
+                e_ext.append((abs((dut[i0] - lod[i0] * k) - dut[ik]) * 1e3,
+                              np.hypot(ax_ + bx * k - xp[ik], ay_ + by * k - yp[ik])))
+                e_hold.append((abs(dut[i0] - dut[ik]) * 1e3,
+                               np.hypot(xp[i0] - xp[ik], yp[i0] - yp[ik])))
+        ee = np.array(e_ext)
+        eh = np.array(e_hold)
+        rot = np.sqrt(ee[:, 1] ** 2 + (0.015 * ee[:, 0]) ** 2)   # 折合旋转误差, ″
+        out.append({
+            "h": h,
+            "dut_ext_max_ms": float(ee[:, 0].max()),
+            "dut_hold_max_ms": float(eh[:, 0].max()),
+            "pm_ext_max_as": float(ee[:, 1].max()),
+            "pm_hold_max_as": float(eh[:, 1].max()),
+            "rot_ext_max_as": float(rot.max()),
+            "n": len(e_ext),
+        })
+    return out
 
 
 def cross_validate_rotation():
@@ -354,7 +406,7 @@ def step_test():
     # Python: 旋转交叉验证
     try:
         n, dr, dv = cross_validate_rotation()
-        ok = dr < 1e-3 and dv < 1e-6      # 1 mm? 实际预期 ~1e-5 km(历元取整差)
+        ok = dr < 1e-3 and dv < 1e-6      # 容差 1 m / 1 mm/s, 实际预期 ~1e-5 km
         log(f"  ITRS→GCRS 旋转 C vs Python: {n} 组, "
             f"max|Δr|={dr:.3e} km, max|Δv|={dv:.3e} km/s -> "
             f"{'PASS' if ok else 'FAIL'}")
@@ -362,6 +414,21 @@ def step_test():
     except Exception as e:                                # noqa: BLE001
         log(f"  旋转交叉验证异常: {e}")
         R["t_crossval"] = {"ok": False, "error": str(e)}
+
+    # 长期产品外推精度回测
+    try:
+        bt = backtest_extrapolation()
+        log("  长期产品(C04)外推留出回测: 跨度/外推DUT1(max ms)/外推极移(max \")/"
+            "折合旋转(max \")")
+        for b in bt:
+            log(f"    {b['h']:>3} 天: {b['dut_ext_max_ms']:.2f} / "
+                f"{b['pm_ext_max_as']:.4f} / {b['rot_ext_max_as']:.4f}"
+                f"（端点保持对照 {b['dut_hold_max_ms']:.2f} ms, "
+                f"{b['pm_hold_max_as']:.4f}\"）")
+        R["t_backtest"] = {"ok": True, "rows": bt}
+    except Exception as e:                                # noqa: BLE001
+        log(f"  外推回测异常: {e}")
+        R["t_backtest"] = {"ok": False, "error": str(e)}
 
     all_ok = reg_ok and eop_ok and R["t_crossval"].get("ok", False)
     R["test"] = {"ok": all_ok,
@@ -410,12 +477,14 @@ def step_report(path):
         A(f"| 天极偏差 dX | {lt['dx_as']:.6f}″ |")
         A(f"| 天极偏差 dY | {lt['dy_as']:.6f}″ |")
         if lag > 1.0:
-            ext = lag * abs(lt['lod_s']) * 1000.0
+            hold = lag * abs(lt['lod_s']) * 1000.0
             A("")
-            A(f"> **注意**：数据滞后 {lag:.1f} 天，若把末端值外推用于当前，"
-              f"DUT1 误差约 LOD×滞后 ≈ {ext:.1f} ms，"
-              f"对应地固旋转误差 ≈ {ext * 1e-3 * 7.292e-5 * 206265:.2f}″。"
-              f"实时性要求高的任务请补接 IERS 快速产品（如 finals.daily）。")
+            A(f"> **策略**：本项目**固定使用长期产品 C04**（不使用 IERS 快速产品）。"
+              f"数据滞后 {lag:.1f} 天期间，`ac_eop_get` 自动外推——DUT1 按 "
+              f"−LOD·Δ（解析关系）、极移按末端 30 天线性趋势。若不做外推仅端点"
+              f"保持，DUT1 误差约 {hold:.1f} ms（↔ "
+              f"{hold * 1e-3 * 7.292e-5 * 206265:.2f}″ 地固旋转）；"
+              f"外推后的实际残差见下方回测表。")
     else:
         A(f"- ❌ 下载/更新失败：{d.get('error', d.get('source', '未知'))}")
     A("")
@@ -455,6 +524,19 @@ def step_report(path):
                   f"max|Δv|={cv['dv_kms']:.2e} km/s）")
             else:
                 A(f"- ITRS→GCRS 旋转交叉验证：❌ FAIL（{cv}）")
+        bt = R.get("t_backtest", {})
+        if bt.get("ok"):
+            A("")
+            A("- 长期产品（C04）外推留出回测（6 个截断起点×逐日评估，"
+              "外推法 = DUT1 −LOD·Δ + 极移末端 30 天线性趋势）：")
+            A("")
+            A("| 预测跨度 | DUT1 外推 max (ms) | DUT1 端点保持 max (ms) | "
+              "极移外推 max (″) | 极移保持 max (″) | 折合旋转误差 max (″) |")
+            A("|---|---|---|---|---|---|")
+            for row in bt["rows"]:
+                A(f"| {row['h']} 天 | {row['dut_ext_max_ms']:.2f} | "
+                  f"{row['dut_hold_max_ms']:.2f} | {row['pm_ext_max_as']:.4f} | "
+                  f"{row['pm_hold_max_as']:.4f} | {row['rot_ext_max_as']:.4f} |")
         A("")
         A(f"**测试总结：{'✅ 全部通过' if t.get('ok') else '❌ 存在失败项'}**")
     else:
@@ -478,8 +560,11 @@ def step_report(path):
     old = []
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
+            # 仅保留形如 "- **2026-11-15 05:12 UTC**：" 的历史条目行
             old = [ln for ln in f
-                   if ln.startswith("- **") and not ln.startswith("- **" + stamp)]
+                   if ln.startswith("- **2") and "-**：" not in ln
+                   and ln.count("UTC**：") == 1
+                   and not ln.startswith("- **" + stamp)]
     A(entry)
     lines.extend(old[:20])
     A("")

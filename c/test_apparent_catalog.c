@@ -11,7 +11,7 @@
  *   - 全星表改正量统计（均值/中位数/P99/最大, 与误差分析表同口径）
  *   - c_sample_output.csv（前 ncsv 星, 供与 Python 参考实现逐星比对）
  *
- * 版本: v1.1.261115-2
+ * 版本: v1.1.261115-3
  */
 #include "apparent_catalog.h"
 

@@ -12,7 +12,7 @@
  *   T6 导出 eop_rotation_sample.csv 供 Python(erfa) 交叉验证
  *   T7 (可选, 给定星表) ac_apparent_catalog_itrs 冒烟测试
  *
- * 版本: v1.1.261115-2
+ * 版本: v1.1.261115-3
  */
 #include "apparent_catalog.h"
 
@@ -83,9 +83,21 @@ int main(int argc, char *argv[])
         check("T2 内部表列时刻插值", st == AC_OK && d < 1e-12, "diff<1e-12");
     }
 
-    /* ---- T3 越界警告 ---- */
-    st = ac_eop_get(&eop, eop.mjd_last + 100.0, &xp, &yp, &dut1, &dx, &dy);
-    check("T3 越界返回警告", st == AC_W_EOP_RANGE, "使用端点值继续");
+    /* ---- T3 越界外推（长期产品策略: DUT1 用 -LOD, 极移用线性趋势） ---- */
+    {
+        const ac_eop_record_t *l = &eop.rec[eop.n - 1];
+        double d = 100.0, exp_dut1;
+        st = ac_eop_get(&eop, eop.mjd_last + d, &xp, &yp, &dut1, &dx, &dy);
+        exp_dut1 = l->dut1_s - l->lod_s * d;
+        check("T3 越界返回警告", st == AC_W_EOP_RANGE, "外推值+警告");
+        check("T3 DUT1 按 -LOD 外推",
+              fabs(dut1 - exp_dut1) < 1e-12, "dut1=dut1_end-LOD*d");
+        check("T3 极移线性趋势外推量级合理",
+              fabs(xp - l->xp_as) < 0.5 && fabs(yp - l->yp_as) < 0.5,
+              "100 天外推偏离端点 <0.5\"");
+        st = ac_eop_get(&eop, eop.mjd_first - 5.0, &xp, &yp, &dut1, &dx, &dy);
+        check("T3 首端越界返回警告", st == AC_W_EOP_RANGE, "端点保持");
+    }
 
     /* ---- T4 往返一致 ---- */
     {

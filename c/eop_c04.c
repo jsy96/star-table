@@ -8,7 +8,7 @@
  * ITRS→GCRS 旋转 = erfaC2t06a（EOP 极移 + DUT1 + IAU2006/2000A 岁差章动,
  * 无旋转原点 CIO 体系）; 速度含地球自转项 v_g = Rᵀ(v_i + ω×r_i)。
  *
- * 版本: v1.1.261115-2
+ * 版本: v1.1.261115-3
  */
 #include "apparent_catalog.h"
 
@@ -96,8 +96,31 @@ void ac_eop_free(ac_eop_t *eop)
 }
 
 /* ------------------------------------------------------------------ */
-/* 插值                                                                */
+/* 插值与外推（本项目固定使用长期产品 C04, 不使用 IERS 快速产品）        */
 /* ------------------------------------------------------------------ */
+
+/* 末端 [i_end-span+1, i_end] 窗口最小二乘拟合 y = a + b·(mjd − t0), 返回外推值 */
+static double eop_fit_extrapolate(const double *mjd, const double *y,
+                                  int i_end, int span, double d)
+{
+    int i0 = i_end - span + 1;
+    int i, cnt = 0;
+    double t0 = mjd[i_end];
+    double sx = 0, sy = 0, sxx = 0, sxy = 0, den, b, a;
+
+    if (i0 < 0) i0 = 0;
+    for (i = i0; i <= i_end; i++) {
+        double x = mjd[i] - t0;
+        sx += x; sy += y[i]; sxx += x * x; sxy += x * y[i];
+        cnt++;
+    }
+    den = (double)cnt * sxx - sx * sx;
+    if (den == 0.0) return y[i_end];
+    b = ((double)cnt * sxy - sx * sy) / den;
+    a = sy / (double)cnt - b * (sx / (double)cnt);
+    return a + b * d;
+}
+
 int ac_eop_get(const ac_eop_t *eop, double mjd_utc,
                double *xp_as, double *yp_as, double *dut1_s,
                double *dx_as, double *dy_as)
@@ -113,11 +136,41 @@ int ac_eop_get(const ac_eop_t *eop, double mjd_utc,
         *dx_as = r[0].dx_as; *dy_as = r[0].dy_as;
         return (mjd_utc < eop->mjd_first) ? AC_W_EOP_RANGE : AC_OK;
     }
-    if (mjd_utc >= eop->mjd_last) {
+    if (mjd_utc == eop->mjd_last) {
         const ac_eop_record_t *l = &r[eop->n - 1];
         *xp_as = l->xp_as; *yp_as = l->yp_as; *dut1_s = l->dut1_s;
         *dx_as = l->dx_as; *dy_as = l->dy_as;
-        return (mjd_utc > eop->mjd_last) ? AC_W_EOP_RANGE : AC_OK;
+        return AC_OK;
+    }
+    if (mjd_utc > eop->mjd_last) {
+        /* 末端之外: 长期产品外推策略（返回 AC_W_EOP_RANGE 告知调用方）
+           - DUT1: d(UT1-UTC)/dt = -LOD （解析关系）
+           - 极移: 末端 30 天线性趋势
+           - dX/dY: 毫角秒级, 端点保持 */
+        const ac_eop_record_t *l = &r[eop->n - 1];
+        double d = mjd_utc - eop->mjd_last;
+        int i, i0 = eop->n - 30;
+        if (i0 < 0) i0 = 0;
+        double *mm = (double *)malloc((size_t)(eop->n - i0) * sizeof(double));
+        double *xx = (double *)malloc((size_t)(eop->n - i0) * sizeof(double));
+        double *yy = (double *)malloc((size_t)(eop->n - i0) * sizeof(double));
+        if (!mm || !xx || !yy) {
+            free(mm); free(xx); free(yy);
+            *xp_as = l->xp_as; *yp_as = l->yp_as; *dut1_s = l->dut1_s;
+            *dx_as = l->dx_as; *dy_as = l->dy_as;
+            return AC_W_EOP_RANGE;
+        }
+        for (i = i0; i < eop->n; i++) {
+            mm[i - i0] = r[i].mjd_utc;
+            xx[i - i0] = r[i].xp_as;
+            yy[i - i0] = r[i].yp_as;
+        }
+        *xp_as  = eop_fit_extrapolate(mm, xx, eop->n - 1 - i0, 30, d);
+        *yp_as  = eop_fit_extrapolate(mm, yy, eop->n - 1 - i0, 30, d);
+        *dut1_s = l->dut1_s - l->lod_s * d;
+        *dx_as = l->dx_as; *dy_as = l->dy_as;
+        free(mm); free(xx); free(yy);
+        return AC_W_EOP_RANGE;
     }
 
     /* 二分: r[lo].mjd <= mjd_utc < r[hi].mjd */

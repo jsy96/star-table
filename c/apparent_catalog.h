@@ -25,7 +25,7 @@ extern "C" {
 #endif
 
 /* ---- 常量 ---- */
-#define AC_VERSION_STRING   "v1.1.261115-2"
+#define AC_VERSION_STRING   "v1.1.261115-3"
 #define AC_EPOCH_GAIA_J2016 2457389.0   /* Gaia DR3 星表历元 J2016.0 (JD) */
 #define AC_EPOCH_J2000      2451545.0   /* 星表已传播至 J2000.0 */
 
@@ -159,9 +159,12 @@ int ac_eop_load(const char *path, ac_eop_t *eop);
 void ac_eop_free(ac_eop_t *eop);
 
 /* 按时刻线性插值 EOP（mjd_utc = JD_UTC − 2400000.5）。
- * 数据范围内返回 AC_OK；越界返回 AC_W_EOP_RANGE 并使用最近端点值
- * （C04 月更滞后约 30 天，实时任务请评估 DUT1 外推误差，
- *  ~LOD×滞后天数 ≈ 0.5 ms/天）。 */
+ * 本项目固定使用长期产品 C04（不使用 IERS 快速产品）。C04 约月更、
+ * 末端滞后约 30 天；超出数据范围时采用外推并返回 AC_W_EOP_RANGE 警告：
+ *   DUT1: dut1(t0+Δ) = dut1(t0) − LOD(t0)·Δ （解析关系）
+ *   极移: 末端 30 天线性趋势外推
+ *   dX/dY: 毫角秒级, 端点保持
+ * 外推残差量级见 update_eop.py 的留出回测（EOP_report.md）。 */
 int ac_eop_get(const ac_eop_t *eop, double mjd_utc,
                double *xp_as, double *yp_as, double *dut1_s,
                double *dx_as, double *dy_as);

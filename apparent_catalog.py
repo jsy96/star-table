@@ -36,7 +36,7 @@ import time
 import numpy as np
 import erfa
 
-__version__ = "v1.1.261115-2"
+__version__ = "v1.1.261115-3"
 
 DJ00 = 2451545.0            # J2000.0 (TDB)
 GAIA_EPOCH_JD = 2457389.0   # Gaia DR3 星表历元 J2016.0
@@ -133,11 +133,28 @@ def load_eop_c04(path):
 
 
 def eop_get(eop, mjd_utc):
-    """线性插值取 EOP；越界返回最近端点值（与 C 版 ac_eop_get 一致）。"""
+    """线性插值取 EOP（与 C 版 ac_eop_get 一致, 长期产品外推策略）。
+
+    末端越界时: DUT1 按 dut1−LOD·Δ 外推（解析关系）, 极移按末端 30 天
+    线性趋势外推, dX/dY 端点保持; 首端越界端点保持。本项目固定使用
+    长期产品 C04, 不使用 IERS 快速产品。
+    """
     m = eop["mjd_utc"]
-    i = np.clip(np.searchsorted(m, mjd_utc), 1, len(m) - 1)
     if mjd_utc <= m[0]:
-        i = 1
+        return (eop["xp_as"][0], eop["yp_as"][0], eop["dut1_s"][0],
+                eop["dx_as"][0], eop["dy_as"][0])
+    if mjd_utc >= m[-1]:
+        d = mjd_utc - m[-1]
+        dut1 = eop["dut1_s"][-1] - eop["lod_s"][-1] * d
+        span = 30
+        m0, m1 = max(0, len(m) - span), len(m) - 1
+        x = m[m0:m1 + 1] - m[m1]
+        out = []
+        for k in ("xp_as", "yp_as"):
+            b, a = np.polyfit(x, eop[k][m0:m1 + 1], 1)
+            out.append(a + b * d)              # a = 拟合在末端 x=0 处的值
+        return (out[0], out[1], dut1, eop["dx_as"][-1], eop["dy_as"][-1])
+    i = int(np.clip(np.searchsorted(m, mjd_utc), 1, len(m) - 1))
     t = (mjd_utc - m[i - 1]) / (m[i] - m[i - 1])
     out = []
     for k in ("xp_as", "yp_as", "dut1_s", "dx_as", "dy_as"):
