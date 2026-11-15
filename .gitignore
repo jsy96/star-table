@@ -8,3 +8,6 @@ __pycache__/
 *.npz
 *.bin
 *.png
+
+# EOP downloaded data (regenerable via update_eop.py)
+eop/
