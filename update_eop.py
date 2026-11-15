@@ -16,7 +16,7 @@ update_eop.py —— IERS EOP C04 接入流水线：下载 → 更新 → 编译
   eop/eopc04_IAU2000.62-now   EOP 数据（原子替换, 旧版备份 .prev）
   EOP_report.md               全流程报告
 
-版本: v1.1.261115-3
+版本: v1.1.261115-4
 """
 import argparse
 import csv
@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 import numpy as np
 import erfa
 
-__version__ = "v1.1.261115-3"
+__version__ = "v1.1.261115-4"
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 EOP_DIR = os.path.join(ROOT, "eop")
@@ -43,6 +43,13 @@ SOURCES = [
     ("IERS EOP PC (hpiers, 2023-11 存档, 应急)",
      "https://hpiers.obspm.fr/iers/eop/eopc04/archive_11_12_2023/eopc04_IAU2000.62-now"),
 ]
+
+# 快速产品源（精度优于长期产品外推, 详见报告对比节; 可达时自动启用）
+RAPID_SOURCES = [
+    ("USNO IERS RS/PC finals.daily (快速, ~1 日滞后)",
+     "https://maia.usno.navy.mil/ser7/finals.daily"),
+]
+RAPID_FILE = os.path.join(EOP_DIR, "finals.daily")
 
 R = {}   # 报告数据收集
 
@@ -67,6 +74,130 @@ def log(msg):
     except UnicodeEncodeError:
         enc = sys.stdout.encoding or "gbk"
         print(msg.encode(enc, errors="replace").decode(enc), flush=True)
+
+
+# ----------------------------------------------------------------------
+# 1b) 快速产品 (finals.daily): 解析 + 与 C04 合并
+# ----------------------------------------------------------------------
+def parse_rapid(path):
+    """解析 USNO finals.daily / finals2000A.daily（空格分隔, 误差列穿插）。
+
+    列序: MJD x xerr y yerr UT1-UTC ut1err LOD loderr [dX dxerr dY dyerr]
+    （1980 版末列为 dpsi/deps, 本项目视方向与 c2t06a 均不消费, 忽略。）
+    返回 [(mjd, x_as, y_as, dut1_s, lod_s), ...] 按 mjd 升序。
+    """
+    rows = []
+    with open(path, "r", encoding="ascii", errors="replace") as f:
+        for line in f:
+            t = line.split()
+            if len(t) < 9:
+                continue
+            try:
+                mjd = float(t[0])
+                x = float(t[1])
+                y = float(t[3])
+                dut1 = float(t[5])
+                lod = float(t[7])
+            except ValueError:
+                continue
+            if not (30000.0 < mjd < 90000.0):
+                continue
+            rows.append((mjd, x, y, dut1, lod))
+    rows.sort(key=lambda r: r[0])
+    return rows
+
+
+def merge_rapid_into_c04(c04_path, rapid_rows):
+    """C04 历史 + 快速产品末端 → 写回 C04 同名同格式文件（C 库零改动）。
+
+    只取快速产品中 MJD > C04 末端的行（C04 重叠段为最终值, 保留不动）。
+    dX/dY 置 0（视方向不做章动修正、c2t06a 不消费该列, 无影响）。
+    返回 (n_appended, mjd_first_rapid, mjd_last_rapid)。
+    """
+    rows = parse_eop(c04_path)
+    last = rows[-1][1]
+    add = [r for r in rapid_rows if r[0] > last]
+    if not add:
+        return 0, None, None
+    with open(c04_path, "a", encoding="ascii") as f:
+        for mjd, x, y, dut1, lod in add:
+            y_, m_, d_, _fd = erfa.jd2cal(2400000.5, mjd)
+            f.write(f"{y_:4d} {m_:2d} {d_:2d} {mjd:7.1f} {x:11.6f} {y:11.6f} "
+                    f"{dut1:12.7f} {lod:11.7f} "
+                    f"{'0.000000':>11s} {'0.000000':>11s} "
+                    f"{'0.000000':>11s} {'0.000000':>11s} "
+                    f"{'0.0000000':>12s} {'0.0000000':>12s} "
+                    f"{'0.000000':>11s} {'0.000000':>11s}\n")
+    return len(add), add[0][0], add[-1][0]
+
+
+def rapid_vs_c04_diff(c04_rows, rapid_rows, n_days=30):
+    """重叠段 |快速−最终| 统计（回答“快速产品精度”的实测口径）。"""
+    import bisect
+    m = [r[1] for r in c04_rows]
+    dx, dy, dd = [], [], []
+    n0 = max(0, len(m) - n_days)
+    for mjd, x, y, dut1, lod in rapid_rows:
+        k = bisect.bisect_left(m, mjd)
+        if k < len(m) and m[k] == mjd and k >= n0:
+            dx.append(abs(x - c04_rows[k][2]))
+            dy.append(abs(y - c04_rows[k][3]))
+            dd.append(abs(dut1 - c04_rows[k][4]))
+    if not dx:
+        return None
+    return {"n": len(dx), "pm_max_mas": max(max(dx), max(dy)) * 1000.0,
+            "dut1_max_ms": max(dd) * 1000.0}
+
+
+def step_rapid(args):
+    """下载/定位快速产品并与 C04 合并。返回报告信息 dict。"""
+    log("\n===== [1b] 快速产品 (finals.daily) =====")
+    info = {"mode": "none"}
+    rapid_rows = None
+
+    src = None
+    if args.input_rapid and os.path.exists(args.input_rapid):
+        shutil.copyfile(args.input_rapid, RAPID_FILE)
+        src = f"本地文件 {args.input_rapid}"
+    else:
+        tmp = RAPID_FILE + ".tmp"
+        for name, url in RAPID_SOURCES:
+            try:
+                http_download(url, tmp, timeout=180)
+                os.replace(tmp, RAPID_FILE)
+                src = f"{name} :: {url}"
+                break
+            except Exception as e:                    # noqa: BLE001
+                log(f"  快速源失败: {name}: {e}")
+    if src is None:
+        log("  快速产品源不可达 → 退化为纯 C04 长期产品 + 外推（当前模式）")
+        log("  手动启用: 下载 https://maia.usno.navy.mil/ser7/finals.daily"
+            " 放到 eop/ 后加参数 --input-rapid eop/finals.daily")
+        return info
+
+    rapid_rows = parse_rapid(RAPID_FILE)
+    if len(rapid_rows) < 10:
+        log(f"  快速产品解析异常（{len(rapid_rows)} 行）→ 忽略")
+        return info
+    log(f"  快速产品: {len(rapid_rows)} 行, "
+        f"覆盖 MJD {rapid_rows[0][0]:.0f}~{rapid_rows[-1][0]:.0f}")
+
+    c04_rows = parse_eop(EOP_FILE)
+    diff = rapid_vs_c04_diff(c04_rows, rapid_rows)
+    n_app, m0, m1 = merge_rapid_into_c04(EOP_FILE, rapid_rows)
+    info = {"mode": "merged", "source": src, "n_rapid": len(rapid_rows),
+            "mjd_rapid_last": rapid_rows[-1][0],
+            "date_rapid_last": mjd2date(rapid_rows[-1][0]),
+            "n_appended": n_app, "diff": diff}
+    if n_app:
+        log(f"  已合并 {n_app} 行快速数据到 C04 之后（至 "
+            f"{mjd2date(m1)}），滞后降至 {mjd_now() - m1:.1f} 天")
+    else:
+        log("  快速产品未超出 C04 末端, 无需合并")
+    if diff:
+        log(f"  重叠段实测 |快速−最终|: 极移 max {diff['pm_max_mas']:.2f} mas, "
+            f"DUT1 max {diff['dut1_max_ms']:.3f} ms（{diff['n']} 天样本）")
+    return info
 
 
 # ----------------------------------------------------------------------
@@ -478,15 +609,36 @@ def step_report(path):
         A(f"| 天极偏差 dY | {lt['dy_as']:.6f}″ |")
         if lag > 1.0:
             hold = lag * abs(lt['lod_s']) * 1000.0
+            rp = R.get("rapid", {})
             A("")
-            A(f"> **策略**：本项目**固定使用长期产品 C04**（不使用 IERS 快速产品）。"
-              f"数据滞后 {lag:.1f} 天期间，`ac_eop_get` 自动外推——DUT1 按 "
-              f"−LOD·Δ（解析关系）、极移按末端 30 天线性趋势。若不做外推仅端点"
-              f"保持，DUT1 误差约 {hold:.1f} ms（↔ "
-              f"{hold * 1e-3 * 7.292e-5 * 206265:.2f}″ 地固旋转）；"
-              f"外推后的实际残差见下方回测表。")
+            if rp.get("mode") == "merged":
+                A(f"> **策略**：长期产品 C04 为历史基底 + **快速产品 finals.daily**"
+                  f"补充末端（至 {rp.get('date_rapid_last', '?')}），当前有效滞后 "
+                  f"{mjd_now() - rp.get('mjd_rapid_last', mjd_now()):.1f} 天；"
+                  f"仅超出快速产品末端的部分才外推（DUT1 按 −LOD·Δ、极移按末端"
+                  f"30 天线性趋势）。")
+            else:
+                A(f"> **策略**：当前**快速产品源不可达，退化为纯长期产品 C04 + 外推**"
+                  f"（DUT1 按 −LOD·Δ、极移按末端 30 天线性趋势）。数据滞后 "
+                  f"{lag:.1f} 天，若仅端点保持 DUT1 误差约 {hold:.1f} ms"
+                  f"（↔ {hold * 1e-3 * 7.292e-5 * 206265:.2f}″ 地固旋转）；"
+                  f"外推后的实际残差见下方回测表。快速产品典型精度优于外推 1~2 个"
+                  f"数量级，网络可达或手动提供 finals.daily（--input-rapid）后自动"
+                  f"升级为合并模式。")
     else:
         A(f"- ❌ 下载/更新失败：{d.get('error', d.get('source', '未知'))}")
+    rp = R.get("rapid", {})
+    if rp.get("mode") == "merged":
+        A("")
+        A("### 快速产品合并详情")
+        A(f"- 来源：{rp['source']}")
+        A(f"- 快速序列：{rp['n_rapid']} 行，末端 {rp['date_rapid_last']}")
+        A(f"- 本次并入 C04 之后：{rp['n_appended']} 行（重叠段保留 C04 最终值）")
+        d = rp.get("diff")
+        if d:
+            A(f"- 重叠段实测 |快速−最终|（{d['n']} 天）：极移 max "
+              f"{d['pm_max_mas']:.2f} mas，DUT1 max {d['dut1_max_ms']:.3f} ms"
+              f" —— 即合并模式下末端数据的实际精度")
     A("")
     A("## 二、编译")
     if b.get("ok") is True:
@@ -580,7 +732,9 @@ def main():
     ap.add_argument("--skip-download", action="store_true")
     ap.add_argument("--skip-build", action="store_true")
     ap.add_argument("--skip-test", action="store_true")
-    ap.add_argument("--input", default=None, help="本地 EOP 文件(跳过网络下载)")
+    ap.add_argument("--input", default=None, help="本地 EOP C04 文件(跳过网络下载)")
+    ap.add_argument("--input-rapid", default=None,
+                    help="本地快速产品文件(finals.daily), 如网络不可达时手动提供")
     ap.add_argument("--report", default=os.path.join(ROOT, "EOP_report.md"))
     ap.add_argument("--version", action="version",
                     version=f"%(prog)s {__version__}")
@@ -611,6 +765,8 @@ def main():
             ok = False
     else:
         ok = step_download(args)
+        if ok:
+            R["rapid"] = step_rapid(args)
     if not ok:
         log("数据不可用，终止。")
         step_report(args.report)

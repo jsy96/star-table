@@ -11,7 +11,7 @@
  * 版权说明: 本文件调用 third_party/erfa 下原样收录的 ERFA 库子集
  * (LGPL-3.0, Copyright NumFOCUS Foundation, 源自 IAU SOFA 库)。
  *
- * 版本: v1.1.261115-3
+ * 版本: v1.1.261115-4
  */
 #include "apparent_catalog.h"
 

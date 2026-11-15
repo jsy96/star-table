@@ -36,7 +36,7 @@ import numpy as np
 import pandas as pd
 import erfa
 
-__version__ = "v1.1.261115-3"
+__version__ = "v1.1.261115-4"
 
 JD_J2000 = 2451545.0
 JD_GAIA_J2016 = 2457389.0     # Gaia DR3 历元 J2016.0
